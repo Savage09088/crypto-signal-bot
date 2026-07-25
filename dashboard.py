@@ -1,47 +1,108 @@
-name: Crypto Signal Bot
+"""
+Writes a tiny static dashboard into docs/ so GitHub Pages can serve it for free.
+No server, no JS build step — just a JSON data file + a plain HTML page that
+fetches it client-side and renders a table, color-coded by buy/sell strength.
+"""
+import json
+import os
+from datetime import datetime, timezone
 
-on:
-  schedule:
-    # Every 5 minutes. GitHub may delay this under load (sometimes 10-15 min) — that's a
-    # platform limit of the free scheduler, not something we can fix from the workflow side.
-    - cron: "*/5 * * * *"
-  workflow_dispatch: {}   # lets you trigger a manual run/test from the GitHub app
+DOCS_DIR = "docs"
+DATA_FILE = os.path.join(DOCS_DIR, "data.json")
+INDEX_FILE = os.path.join(DOCS_DIR, "index.html")
 
-permissions:
-  contents: write   # needed so the workflow can commit updated state.json back to the repo
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto Signal Dashboard</title>
+<style>
+  body { font-family: -apple-system, Roboto, Arial, sans-serif; background:#0f1115; color:#e6e6e6; margin:0; padding:16px; }
+  h1 { font-size:1.3rem; margin-bottom:4px; }
+  #updated { color:#888; font-size:0.85rem; margin-bottom:16px; }
+  table { width:100%; border-collapse:collapse; font-size:0.9rem; }
+  th, td { padding:10px 8px; text-align:left; border-bottom:1px solid #262a33; }
+  th { color:#999; font-weight:600; font-size:0.75rem; text-transform:uppercase; }
+  .buy { color:#3ddc84; font-weight:700; }
+  .sell { color:#ff5c5c; font-weight:700; }
+  .neutral { color:#888; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:700; }
+  .badge-buy { background:#123321; color:#3ddc84; }
+  .badge-sell { background:#3a1616; color:#ff5c5c; }
+  .badge-neutral { background:#1c1f26; color:#888; }
+  #empty { color:#888; padding:24px 0; text-align:center; }
+</style>
+</head>
+<body>
+  <h1>📊 Crypto Signal Dashboard</h1>
+  <div id="updated">Loading…</div>
+  <table id="tbl">
+    <thead>
+      <tr><th>Coin</th><th>Price</th><th>Buy</th><th>Sell</th><th>RSI</th><th>Signal</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div id="empty" style="display:none;">No data yet — the bot hasn't completed a run.</div>
 
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+<script>
+async function load() {
+  const res = await fetch('data.json?t=' + Date.now());
+  const data = await res.json();
+  document.getElementById('updated').textContent = 'Last updated: ' + new Date(data.updated_utc).toLocaleString();
+  const rows = document.getElementById('rows');
+  rows.innerHTML = '';
+  if (!data.coins || data.coins.length === 0) {
+    document.getElementById('empty').style.display = 'block';
+    return;
+  }
+  data.coins.sort((a,b) => Math.max(b.buy_strength,b.sell_strength) - Math.max(a.buy_strength,a.sell_strength));
+  for (const c of data.coins) {
+    const tr = document.createElement('tr');
+    let badge = '<span class="badge badge-neutral">watching</span>';
+    if (c.buy_strength >= 70) badge = '<span class="badge badge-buy">🟢 HEAVY BUY</span>';
+    else if (c.sell_strength >= 70) badge = '<span class="badge badge-sell">🔴 HEAVY SELL</span>';
+    tr.innerHTML = `
+      <td><strong>${c.symbol}</strong></td>
+      <td>$${c.last_price}</td>
+      <td class="buy">${c.buy_strength}</td>
+      <td class="sell">${c.sell_strength}</td>
+      <td class="neutral">${c.rsi}</td>
+      <td>${badge}</td>`;
+    rows.appendChild(tr);
+  }
+}
+load();
+setInterval(load, 60000); // refresh view every 60s (data itself updates every ~5 min)
+</script>
+</body>
+</html>
+"""
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+def write_dashboard(results: list[tuple[str, str, dict]]):
+    """results: list of (symbol, source, metrics_dict) as produced in main.py"""
+    os.makedirs(DOCS_DIR, exist_ok=True)
 
-      - name: Run signal bot
-        env:
-          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
-          WHATSAPP_PHONE: ${{ secrets.WHATSAPP_PHONE }}
-          BUY_ALERT_THRESHOLD: "70"
-          SELL_ALERT_THRESHOLD: "70"
-          COOLDOWN_MINUTES: "60"
-          TOP_MOVERS_COUNT: "8"
-        run: python main.py
+    payload = {
+        "updated_utc": datetime.now(timezone.utc).isoformat(),
+        "coins": [
+            {
+                "symbol": symbol,
+                "source": source,
+                "last_price": m["last_price"],
+                "buy_strength": m["buy_strength"],
+                "sell_strength": m["sell_strength"],
+                "rsi": m["rsi"],
+            }
+            for symbol, source, m in results
+        ],
+    }
 
-      - name: Persist alert state and dashboard
-        run: |
-          git config user.name "crypto-signal-bot"
-          git config user.email "actions@github.com"
-          git add state.json docs/
-          git diff --cached --quiet || git commit -m "chore: update alert state + dashboard [skip ci]"
-          git push
+    with open(DATA_FILE, "w") as f:
+        json.dump(payload, f, indent=2)
+
+    # Only write index.html if it doesn't exist yet (avoid clobbering any manual edits)
+    if not os.path.exists(INDEX_FILE):
+        with open(INDEX_FILE, "w") as f:
+            f.write(INDEX_HTML)
